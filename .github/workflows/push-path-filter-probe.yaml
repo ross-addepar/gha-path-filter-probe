@@ -1,100 +1,217 @@
-name: Push path-filter probe (with paths)
+name: ADL Python CI Probe
 
 on:
   push:
     branches:
-      - '**'
+      - 'main'
+      - 'release/**'
     paths:
-      - '**'
-  workflow_dispatch:
+      - '**'    # skip workflow for empty push (i.e. release branch creation)
+  pull_request:
+    branches:
+      - 'main'
+      - 'release/**'
 
 permissions:
   contents: read
 
+concurrency:
+  group: adl-python-ci-probe-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
-  inspect-push:
+  detect-changes:
+    name: Detect changes
     runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      notebooks: ${{ steps.filter.outputs.notebooks }}
+      terraform: ${{ steps.filter.outputs.terraform }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Inspect push payload and changed files
+      - name: Classify changed files
+        id: filter
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.before }}
-          HEAD_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           REF_CREATED: ${{ github.event.created || false }}
         run: |
-          set -uo pipefail
-
-          null_sha=0000000000000000000000000000000000000000
-
-          echo "event name: $GITHUB_EVENT_NAME"
-          echo "ref: $GITHUB_REF"
-          echo "created: $REF_CREATED"
-          echo "before: $BASE_SHA"
-          echo "after: $HEAD_SHA"
-          echo
-          echo "Selected raw payload fields:"
-          jq '{
-            created,
-            before,
-            after,
-            ref,
-            deleted,
-            forced,
-            compare,
-            commits: [.commits[] | {id, added, modified, removed}]
-          }' "$GITHUB_EVENT_PATH"
-          echo
-
-          changed_files=""
-          if [ "$REF_CREATED" != true ]; then
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            changed_files="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+          elif [ "$REF_CREATED" = true ]; then
+            # Created refs have no "before" SHA; use the parent of the first pushed commit.
+            # This picks up the same set of files github uses to evaluate the workflow 'paths' filter.
+            # We know there's at least one commit in this push because of the top-level '**' filter.
+            first_pushed_commit="$(jq -r '.commits[0].id' "$GITHUB_EVENT_PATH")"
+            base_sha="$(git rev-parse "$first_pushed_commit^")"
+            changed_files="$(git diff --name-only "$base_sha" "$HEAD_SHA")"
+          else
             changed_files="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
           fi
 
-          echo "Changed files (empty for a created ref):"
+          python=false
+          notebooks=false
+          terraform=false
+
+          if [ -n "$changed_files" ]; then
+            while IFS= read -r file; do
+              case "$file" in
+                notebooks/*)
+                  notebooks=true
+                  ;;
+                terraform/*)
+                  terraform=true
+                  ;;
+                *)
+                  python=true
+                  ;;
+              esac
+            done <<< "$changed_files"
+          fi
+
+          echo "Changed files:"
           if [ -n "$changed_files" ]; then
             printf '%s\n' "$changed_files"
           else
             echo "<empty>"
           fi
-          echo "Changed-files value is empty: $([ -z "$changed_files" ] && echo true || echo false)"
-          echo
+          echo "Classification: python=$python notebooks=$notebooks terraform=$terraform"
 
-          echo "Files changed by commits in the push payload:"
-          mapfile -t pushed_commits < <(jq -r '.commits[].id' "$GITHUB_EVENT_PATH")
-          if [ "${#pushed_commits[@]}" -gt 0 ]; then
-            for commit in "${pushed_commits[@]}"; do
-              git diff-tree --root --no-commit-id --name-status -r "$commit"
-            done | sort -u
-          else
-            echo "<empty>"
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+          echo "notebooks=$notebooks" >> "$GITHUB_OUTPUT"
+          echo "terraform=$terraform" >> "$GITHUB_OUTPUT"
+
+  pre-commit_checks:
+    name: Pre-Commit Checks
+    needs: detect-changes
+    if: needs.detect-changes.outputs.python == 'true' || needs.detect-changes.outputs.notebooks == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ran test pre-commit checks"
+
+  terraform_checks:
+    name: Terraform Checks
+    needs: detect-changes
+    if: needs.detect-changes.outputs.terraform == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ran test terraform checks"
+
+  setup-dependencies:
+    name: Set up dependency cache
+    needs: detect-changes
+    if: needs.detect-changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ran test setup dependencies"
+
+  all-unit-tests:
+    name: ADL Unit Tests
+    needs: [detect-changes, setup-dependencies]
+    if: needs.detect-changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ran test unit tests"
+
+  mypy-tests:
+    name: Mypy Tests
+    needs: [detect-changes, setup-dependencies]
+    if: needs.detect-changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ran test mypy"
+
+  test-apps:
+    name: Test apps
+    needs: [detect-changes, setup-dependencies]
+    if: needs.detect-changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ran test apps"
+
+  all-tests-pass:
+    name: All Required Tests Pass
+    needs:
+      - detect-changes
+      - pre-commit_checks
+      - terraform_checks
+      - all-unit-tests
+      - mypy-tests
+      - test-apps
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      success: ${{ steps.result.outputs.success }}
+    steps:
+      - name: Require successful checks
+        id: result
+        env:
+          DETECT_CHANGES_RESULT: ${{ needs.detect-changes.result }}
+          PYTHON_CHANGED: ${{ needs.detect-changes.outputs.python }}
+          NOTEBOOKS_CHANGED: ${{ needs.detect-changes.outputs.notebooks }}
+          TERRAFORM_CHANGED: ${{ needs.detect-changes.outputs.terraform }}
+          PRE_COMMIT_RESULT: ${{ needs.pre-commit_checks.result }}
+          TERRAFORM_RESULT: ${{ needs.terraform_checks.result }}
+          UNIT_TESTS_RESULT: ${{ needs.all-unit-tests.result }}
+          MYPY_RESULT: ${{ needs.mypy-tests.result }}
+          APPS_RESULT: ${{ needs.test-apps.result }}
+        run: |
+          if [ "$DETECT_CHANGES_RESULT" != success ]; then
+            echo "Change detection did not succeed: $DETECT_CHANGES_RESULT"
+            echo "success=false" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
-          echo
 
-          echo "Raw git diff against before -> after:"
-          if diff_output="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>&1)"; then
-            echo "exit: 0"
-            if [ -n "$diff_output" ]; then
-              printf '%s\n' "$diff_output"
-            else
-              echo "<empty>"
-            fi
-          else
-            status=$?
-            echo "exit: $status"
-            printf '%s\n' "$diff_output"
+          required_results=()
+
+          if [ "$PYTHON_CHANGED" = true ] || [ "$NOTEBOOKS_CHANGED" = true ]; then
+            required_results+=("$PRE_COMMIT_RESULT")
           fi
-          echo
 
-          if [ "$BASE_SHA" = "$null_sha" ]; then
-            echo "The before SHA is the all-zero null SHA."
-            echo "Git does not have a root commit object at that SHA:"
-            if git cat-file -e "$null_sha^{commit}" 2>/dev/null; then
-              echo "unexpectedly present"
-            else
-              echo "not present"
+          if [ "$TERRAFORM_CHANGED" = true ]; then
+            required_results+=("$TERRAFORM_RESULT")
+          fi
+
+          if [ "$PYTHON_CHANGED" = true ]; then
+            required_results+=("$UNIT_TESTS_RESULT" "$MYPY_RESULT" "$APPS_RESULT")
+          fi
+
+          for result in "${required_results[@]}"; do
+            if [ "$result" != success ]; then
+              echo "success=false" >> "$GITHUB_OUTPUT"
+              exit 1
             fi
+          done
+
+          echo "success=true" >> "$GITHUB_OUTPUT"
+
+  cd:
+    name: CD
+    needs: all-tests-pass
+    if: github.event_name == 'push' && needs.all-tests-pass.outputs.success == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ran CD"
+
+  ci:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [all-tests-pass, cd]
+    steps:
+      - run: |
+          passed="${{ needs.all-tests-pass.outputs.success }}"
+          cd_result="${{ needs.cd.result }}"
+          if [[ $passed == "true" \
+            && ( $cd_result == "success" || $cd_result == "skipped" ) \
+          ]]; then
+            echo "ci passed"
+            exit 0
+          else
+            echo "ci failed"
+            exit 1
           fi
