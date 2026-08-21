@@ -63,6 +63,17 @@ jobs:
           echo "Changed-files value is empty: $([ -z "$changed_files" ] && echo true || echo false)"
           echo
 
+          echo "Files changed by commits in the push payload:"
+          mapfile -t pushed_commits < <(jq -r '.commits[].id' "$GITHUB_EVENT_PATH")
+          if [ "${#pushed_commits[@]}" -gt 0 ]; then
+            for commit in "${pushed_commits[@]}"; do
+              git diff-tree --root --no-commit-id --name-status -r "$commit"
+            done | sort -u
+          else
+            echo "<empty>"
+          fi
+          echo
+
           echo "Raw git diff against before -> after:"
           if diff_output="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>&1)"; then
             echo "exit: 0"
