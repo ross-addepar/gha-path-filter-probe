@@ -192,7 +192,7 @@ jobs:
   cd:
     name: CD
     needs: all-tests-pass
-    if: ${{ github.event_name == 'push' && needs.all-tests-pass.outputs.success == 'true' }}
+    if: always() && github.event_name == 'push' && needs.all-tests-pass.outputs.success == 'true'
     runs-on: ubuntu-latest
     steps:
       - run: echo "ran CD"
